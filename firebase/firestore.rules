@@ -1,0 +1,279 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  function signedIn() { return request.auth != null; }
+  function owner(uid) { return signedIn() && request.auth.uid == uid; }
+  // Roles are isolated from member-editable profiles.
+  function isAdmin() {
+   return signedIn() && exists(/databases/$(database)/documents/roles/$(request.auth.uid))
+    && get(/databases/$(database)/documents/roles/$(request.auth.uid)).data.role == 'admin';
+  }
+  match /roles/{uid} {
+   allow get: if owner(uid) || isAdmin();
+   allow list: if isAdmin();
+   allow create, update: if isAdmin() && uid != request.auth.uid
+    && exists(/databases/$(database)/documents/users/$(uid))
+    && request.resource.data.keys().hasAll(['role','updatedBy','updatedAt'])
+    && request.resource.data.keys().hasOnly(['role','updatedBy','updatedAt'])
+    && request.resource.data.role in ['member','trainer','admin']
+    && request.resource.data.updatedBy == request.auth.uid
+    && request.resource.data.updatedAt == request.time;
+   // No client deletes; demotion is an explicit assignment to Member.
+  }
+  function isTrainer() {
+   return signedIn() && exists(/databases/$(database)/documents/roles/$(request.auth.uid))
+    && get(/databases/$(database)/documents/roles/$(request.auth.uid)).data.role == 'trainer';
+  }
+  function teaches(id) {
+   return isTrainer() && exists(/databases/$(database)/documents/assignments/$(id))
+    && get(/databases/$(database)/documents/assignments/$(id)).data.trainerUid == request.auth.uid;
+  }
+  match /assignments/{id} {
+   allow read: if isAdmin() || (isTrainer() && resource.data.trainerUid == request.auth.uid);
+   allow create, update: if isAdmin()
+    && request.resource.data.keys().hasOnly(['classId','date','startsAt','capacity','trainerUid','trainerName','updatedBy','updatedAt'])
+    && validSession({'classId':request.resource.data.classId,'date':request.resource.data.date,'startsAt':request.resource.data.startsAt,'capacity':request.resource.data.capacity,'bookedCount':0,'updatedAt':request.resource.data.updatedAt},id)
+    && request.resource.data.startsAt > request.time
+    && get(/databases/$(database)/documents/roles/$(request.resource.data.trainerUid)).data.role == 'trainer'
+    && request.resource.data.trainerName == get(/databases/$(database)/documents/users/$(request.resource.data.trainerUid)).data.username
+    && request.resource.data.updatedBy == request.auth.uid;
+  }
+  match /classRosters/{id}/members/{uid} {
+   allow read: if owner(uid) || isAdmin() || teaches(id);
+   allow create, update: if (owner(uid) || ((isAdmin() || teaches(id)) && request.resource.data.cancelled == true))
+    && request.resource.data.keys().hasOnly(['uid','sessionId','classId','date','username','cancelled','updatedAt'])
+    && request.resource.data.uid == uid && request.resource.data.sessionId == id
+    && request.resource.data.username is string && request.resource.data.username.size() <= 100
+    && request.resource.data.updatedAt == request.time
+    && request.resource.data.classId == getAfter(/databases/$(database)/documents/users/$(uid)/bookings/$(id)).data.classId
+    && request.resource.data.date == getAfter(/databases/$(database)/documents/users/$(uid)/bookings/$(id)).data.date
+    && request.resource.data.cancelled == getAfter(/databases/$(database)/documents/users/$(uid)/bookings/$(id)).data.cancelled;
+  }
+  function isMember() {
+   return signedIn() && (!exists(/databases/$(database)/documents/roles/$(request.auth.uid))
+    || get(/databases/$(database)/documents/roles/$(request.auth.uid)).data.role == 'member');
+  }
+  function staff(uid) {
+   return exists(/databases/$(database)/documents/roles/$(uid))
+    && get(/databases/$(database)/documents/roles/$(uid)).data.role in ['trainer','admin'];
+  }
+  function staffRelease(id) {
+   let uid = request.resource.data.get('releasedUid','');
+   let path = /databases/$(database)/documents/users/$(uid)/bookings/$(id);
+   return (isAdmin() || teaches(id)) && exists(path)
+    && get(path).data.cancelled == false && getAfter(path).data.cancelled == true;
+  }
+  function pad(n) { return n < 10 ? '0' + string(n) : string(n); }
+  function dateString(t) { return string(t.year()) + '-' + pad(t.month()) + '-' + pad(t.day()); }
+  function legacySession(d, id) {
+   let config = {
+    'strength': {'capacity':12,'hour':11,'minute':30,'days':[1,2,4,5]},
+    'yoga': {'capacity':10,'hour':2,'minute':0,'days':[1,2,3,5,6,7]},
+    'hiit': {'capacity':16,'hour':3,'minute':30,'days':[1,2,4,5,6]},
+    'pilates': {'capacity':8,'hour':7,'minute':0,'days':[1,3,4,6,7]}
+   };
+   return d.keys().hasAll(['classId','date','startsAt','capacity','bookedCount','updatedAt'])
+    && d.keys().hasOnly(['classId','date','startsAt','capacity','bookedCount','updatedAt','releasedUid'])
+    && d.classId in config && d.startsAt is timestamp
+    && d.date == dateString(d.startsAt) && id == d.date + '_' + d.classId
+    && d.startsAt.hours() == config[d.classId].hour
+    && d.startsAt.minutes() == config[d.classId].minute
+    && d.startsAt.seconds() == 0 && d.startsAt.nanos() == 0
+    && d.startsAt.dayOfWeek() in config[d.classId].days
+    && d.capacity == config[d.classId].capacity
+    && d.bookedCount is int && d.bookedCount >= 0 && d.bookedCount <= d.capacity
+    && d.updatedAt == request.time;
+  }
+  match /classCatalog/{id} {
+   allow read: if signedIn();
+   allow create, update: if isAdmin()
+    && request.resource.data.keys().hasAll(['title','category','description','image','active','updatedAt'])
+    && request.resource.data.keys().hasOnly(['title','category','description','image','active','archived','updatedAt'])
+    && (!('archived' in request.resource.data) || (request.resource.data.archived == true && request.resource.data.active == false))
+    && request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 100
+    && request.resource.data.category is string && request.resource.data.category.size() <= 80
+    && request.resource.data.description is string && request.resource.data.description.size() <= 1500
+    && request.resource.data.image.matches('images/(strength|yoga|hiit|pilates)-reference[.]jpg')
+    && request.resource.data.active is bool && request.resource.data.updatedAt == request.time;
+  }
+  function validRound(d,id) {
+   return d.keys().hasAll(['classId','date','startsAt','endsAt','capacity','location','status','updatedBy','updatedAt'])
+    && d.keys().hasOnly(['classId','date','startsAt','endsAt','capacity','location','status','updatedBy','updatedAt','trainerName','trainerUid'])
+    && d.classId is string && id == d.date + '_' + d.classId
+    && exists(/databases/$(database)/documents/classCatalog/$(d.classId))
+    && d.startsAt is timestamp && d.endsAt is timestamp && d.startsAt > request.time && d.endsAt > d.startsAt
+    && d.date == dateString(d.startsAt + duration.value(7,'h'))
+    && d.date == dateString(d.endsAt + duration.value(7,'h'))
+    && d.capacity is int && d.capacity >= 1 && d.capacity <= 200
+    && d.location is string && d.location.size() > 0 && d.location.size() <= 150
+    && d.status in ['open','closed'] && d.updatedBy == request.auth.uid && d.updatedAt == request.time;
+  }
+  function preserveBookedRound(d,id) {
+   let p = /databases/$(database)/documents/sessions/$(id);
+   let r = /databases/$(database)/documents/classSchedules/$(id);
+   return !exists(p) || (d.capacity >= get(p).data.bookedCount
+    && (get(p).data.bookedCount == 0 || (d.startsAt == get(p).data.startsAt
+     && (!exists(r) || (d.endsAt == get(r).data.endsAt && d.location == get(r).data.location)))));
+  }
+  match /classSchedules/{id} {
+   allow read: if signedIn();
+   allow update: if isAdmin() && request.resource.data.status == 'cancelled'
+    && resource.data.status in ['open','closed']
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedBy','updatedAt'])
+    && request.resource.data.updatedBy == request.auth.uid && request.resource.data.updatedAt == request.time;
+   allow create, update: if isAdmin() && validRound(request.resource.data,id)
+    && (resource == null || resource.data.status != 'cancelled'
+     || (resource.data.updatedAt < resource.data.startsAt
+      && getAfter(/databases/$(database)/documents/sessions/$(id)).data.bookedCount == 0
+      && (!exists(/databases/$(database)/documents/sessions/$(id))
+       || get(/databases/$(database)/documents/sessions/$(id)).data.bookedCount == 0)))
+    && (!('trainerUid' in request.resource.data)
+     || (request.resource.data.trainerUid is string
+      && getAfter(/databases/$(database)/documents/assignments/$(id)).data.trainerUid == request.resource.data.trainerUid))
+    && preserveBookedRound(request.resource.data,id)
+    && getAfter(/databases/$(database)/documents/sessions/$(id)).data.capacity == request.resource.data.capacity
+    && getAfter(/databases/$(database)/documents/sessions/$(id)).data.startsAt == request.resource.data.startsAt;
+  }
+  function configuredSession(d,id) {
+   let r = getAfter(/databases/$(database)/documents/classSchedules/$(id)).data;
+   return d.keys().hasAll(['classId','date','startsAt','capacity','bookedCount','updatedAt'])
+    && d.keys().hasOnly(['classId','date','startsAt','capacity','bookedCount','updatedAt','releasedUid'])
+    && d.classId == r.classId && d.date == r.date && d.startsAt == r.startsAt && d.capacity == r.capacity
+    && d.bookedCount is int && d.bookedCount >= 0 && d.bookedCount <= r.capacity
+    && d.updatedAt == request.time;
+  }
+  function enrollmentOpen(id) {
+   let r = get(/databases/$(database)/documents/classSchedules/$(id)).data;
+   return r.status == 'open' && get(/databases/$(database)/documents/classCatalog/$(r.classId)).data.active == true;
+  }
+  function validSession(d,id) {
+   return exists(/databases/$(database)/documents/classSchedules/$(id)) ? configuredSession(d,id) : legacySession(d,id);
+  }
+  function bookingPath(id) {
+   return /databases/$(database)/documents/users/$(request.auth.uid)/bookings/$(id);
+  }
+  function activeAfter(id) { return getAfter(bookingPath(id)).data.cancelled == false; }
+  function activeBefore(id) { return exists(bookingPath(id)) && get(bookingPath(id)).data.cancelled == false; }
+  match /sessions/{id} {
+   allow read: if signedIn();
+   allow create: if isAdmin() && configuredSession(request.resource.data,id) && request.resource.data.bookedCount == 0;
+   allow update: if isAdmin() && configuredSession(request.resource.data,id)
+    && request.resource.data.bookedCount == resource.data.bookedCount
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['classId','date','startsAt','capacity','updatedAt'])
+    && request.resource.data.classId == resource.data.classId && request.resource.data.date == resource.data.date;
+   allow create: if isMember() && enrollmentOpen(id) && validSession(request.resource.data,id)
+    && request.resource.data.startsAt > request.time
+    && request.resource.data.bookedCount == 1 && !activeBefore(id) && activeAfter(id);
+   allow update: if signedIn() && validSession(request.resource.data,id)
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['bookedCount','updatedAt','releasedUid'])
+    && ((request.resource.data.bookedCount == resource.data.bookedCount + 1
+      && isMember() && enrollmentOpen(id) && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['releasedUid'])
+      && resource.data.startsAt > request.time && !activeBefore(id) && activeAfter(id))
+     || (request.resource.data.bookedCount == resource.data.bookedCount - 1
+      && ((activeBefore(id) && !activeAfter(id) && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['releasedUid'])) || staffRelease(id))));
+  }
+
+  // เปิดช่องรับค่าการแตะบัตรล่าสุดจาก ESP32-S3
+  match /rfidReader/{deviceId} {
+   allow read: if staff(request.auth.uid);
+   allow write: if true;
+  }
+
+  match /checkins/{id} {
+   function validCheckin(d) {
+    let round = get(/databases/$(database)/documents/classSchedules/$(d.sessionId)).data;
+    return d.keys().hasAll(['sessionId','classId','date','uid','username','role','rfidUid','method','recordedBy','status','checkedInAt'])
+     && d.keys().hasOnly(['sessionId','classId','date','uid','username','role','rfidUid','method','recordedBy','status','checkedInAt','reason'])
+     && d.sessionId is string && d.uid is string && id == d.sessionId + '_' + d.uid
+     && d.classId == round.classId && d.date == round.date
+     && round.status in ['open','closed'] && request.time >= round.startsAt && request.time < round.endsAt
+     && d.username is string && d.username.size() > 0 && d.username.size() <= 100
+     && d.status == 'checked_in' && d.checkedInAt == request.time && d.recordedBy == request.auth.uid;
+   }
+   function validAttendance(d) {
+    let booking = /databases/$(database)/documents/users/$(d.uid)/bookings/$(d.sessionId);
+    let assignment = /databases/$(database)/documents/assignments/$(d.sessionId);
+    return (d.role == 'member' && exists(booking) && get(booking).data.cancelled == false)
+     || (d.role == 'trainer' && exists(assignment) && get(assignment).data.trainerUid == d.uid);
+   }
+   function validMethod(d) {
+    return (d.method == 'manual' && teaches(d.sessionId) && d.role == 'member'
+      && d.uid != request.auth.uid && d.rfidUid == '' && d.reason is string
+      && d.reason.size() > 0 && d.reason.size() <= 200)
+     || (d.method == 'rfid' && !('reason' in d)
+      && (owner(d.uid) || isAdmin() || teaches(d.sessionId))
+      && d.rfidUid is string && d.rfidUid.size() > 0
+      && get(/databases/$(database)/documents/rfidCards/$(d.rfidUid)).data.uid == d.uid);
+   }
+   allow read: if signedIn();
+   allow create: if signedIn() && validCheckin(request.resource.data)
+    && validAttendance(request.resource.data) && validMethod(request.resource.data);
+  }
+
+  match /notifications/{id} {
+   function validNotification(d) {
+    return d.keys().hasOnly(['targetUid','audience','title','message','type','machineName','matchedBooking','read','createdAt','sessionId'])
+     && d.targetUid is string && d.title is string && d.title.size() <= 300
+     && d.message is string && d.message.size() <= 3000 && d.type is string
+     && d.machineName is string && d.matchedBooking is bool
+     && d.read == false && d.createdAt == request.time;
+   }
+   function forAssignedTrainer(d) {
+    let assignment = /databases/$(database)/documents/assignments/$(d.sessionId);
+    let booking = /databases/$(database)/documents/users/$(request.auth.uid)/bookings/$(d.sessionId);
+    return d.sessionId is string && d.targetUid != ''
+     && exists(assignment) && get(assignment).data.trainerUid == d.targetUid
+     && exists(booking) && ((d.type == 'booking_cancelled' && get(booking).data.cancelled == true)
+      || (d.type in ['booking_created','checkin_success'] && get(booking).data.cancelled == false));
+   }
+   allow read: if owner(resource.data.targetUid) || (isAdmin() && resource.data.audience == 'admin');
+   allow create: if signedIn() && validNotification(request.resource.data)
+    && ((request.resource.data.audience in ['member','user'] && owner(request.resource.data.targetUid))
+     || (isAdmin() && request.resource.data.audience in ['user','trainer','system','admin','staff'])
+     || (request.resource.data.audience == 'trainer' && forAssignedTrainer(request.resource.data)));
+   allow update: if (owner(resource.data.targetUid) || (isAdmin() && resource.data.audience == 'admin'))
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+    && request.resource.data.read == true;
+  }
+
+  match /users/{uid} {
+   allow read: if owner(uid) || staff(request.auth.uid);
+   allow create, update: if owner(uid)
+    && request.resource.data.keys().hasOnly(['username','email','thaiName','lastName','phone','rfidUid','updatedAt'])
+    && request.resource.data.username is string && request.resource.data.username.size() > 0
+    && request.resource.data.username.size() <= 100
+    && request.resource.data.email == request.auth.token.email
+    && request.resource.data.updatedAt == request.time;
+   allow update: if staff(request.auth.uid)
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rfidUid', 'updatedAt'])
+    && request.resource.data.rfidUid is string
+    && request.resource.data.updatedAt == request.time;
+
+   match /bookings/{id} {
+    function validBooking(d) {
+     let session = getAfter(/databases/$(database)/documents/sessions/$(id)).data;
+     return d.keys().hasOnly(['classId','date','sessionId','cancelled','createdAt','updatedAt'])
+      && d.keys().hasAll(['classId','date','sessionId','cancelled','createdAt','updatedAt'])
+      && d.sessionId == id && d.classId == session.classId && d.date == session.date
+      && getAfter(/databases/$(database)/documents/classRosters/$(id)/members/$(uid)).data.cancelled == d.cancelled
+      && d.cancelled is bool && d.createdAt is timestamp && d.updatedAt == request.time;
+    }
+    function countChanged(delta) {
+     let path = /databases/$(database)/documents/sessions/$(id);
+     return getAfter(path).data.bookedCount == (exists(path) ? get(path).data.bookedCount : 0) + delta;
+    }
+    allow read: if owner(uid) || (isAdmin() && staff(uid));
+    allow create: if owner(uid) && isMember() && enrollmentOpen(id) && validBooking(request.resource.data)
+     && request.resource.data.createdAt == request.time && !request.resource.data.cancelled
+     && getAfter(/databases/$(database)/documents/sessions/$(id)).data.startsAt > request.time
+     && countChanged(1);
+    allow update: if (owner(uid) || ((isAdmin() || teaches(id)) && request.resource.data.cancelled == true)) && validBooking(request.resource.data)
+     && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['cancelled','updatedAt'])
+     && request.resource.data.cancelled != resource.data.cancelled
+     && (request.resource.data.cancelled ? (countChanged(-1)
+       && (!owner(uid) || !isMember() || get(/databases/$(database)/documents/sessions/$(id)).data.startsAt > request.time))
+       : (isMember() && enrollmentOpen(id) && owner(uid) && getAfter(/databases/$(database)/documents/sessions/$(id)).data.startsAt > request.time && countChanged(1)));
+   }
+  }
+ }
+}
